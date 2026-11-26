@@ -5,15 +5,15 @@ import agentpy as ap
 
 BOARD_SIZE = 8
 CARD_POOLS = {
-    "Slider": ("Pawn", "King", "Rook", "Bishop", "Cannon", "Stag", "Ox", "Boar", "Lion"),
+    "Slider": ("Pawn", "Checker", "King", "Rook", "Bishop", 
+               "Cannon", "Stag", "Dragon Horse", "Dragon King", "Lion"),
     "Leaper": (
-        "Elephant", "Camel", "Knight", "Phoenix", "Kirin", "Wizard",
-        "Checker", "Centaur", "Okapi", "Zebra", "Lancer",
+        "Elephant", "Camel", "Knight", "Phoenix", "Kirin", 
+        "Wizard", "Centaur", "Okapi", "Zebra", "Lancer",
     ),
     "Compound": (
-        "Queen", "Zeus's Smite", "Dragon Horse", "Dragon King",
-        "Princess", "Empress", "Amazon", "Poseidon's Trident",
-        "Hades' Underworld",
+        "Queen", "Zeus's Smite", "Ox", "Boar", "Princess", 
+        "Empress", "Amazon", "Poseidon's Trident", "Hades' Underworld",
     ),
 }
 CARD_SLOT_CATEGORIES = ("Slider", "Slider", "Leaper", "Leaper", "Compound")
