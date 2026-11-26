@@ -15,6 +15,7 @@ CARD_HELP = {
     "King": "Move one square in any direction.",
     "Rook": "Slide any distance horizontally or vertically.",
     "Bishop": "Slide any distance diagonally.",
+    "Cannon": "Moves any number of squares horizontally or vertically. It moves freely to empty squares but must jump over exactly one piece to capture an enemy.",
     "Stag": "Slide vertically, or move one square in any direction.",
     "Ox": "Slide vertically or diagonally; not sideways.",
     "Boar": "Slide sideways or diagonally; not forward or backward.",
