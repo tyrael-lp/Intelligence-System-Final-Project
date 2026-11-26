@@ -5,14 +5,15 @@ import agentpy as ap
 
 BOARD_SIZE = 8
 CARD_POOLS = {
-    "Slider": ("Pawn", "King", "Rook", "Bishop", "Stag", "Ox", "Boar", "Lion"),
+    "Slider": ("Pawn", "King", "Rook", "Bishop", "Cannon", "Stag", "Ox", "Boar", "Lion"),
     "Leaper": (
         "Elephant", "Camel", "Knight", "Phoenix", "Kirin", "Wizard",
         "Checker", "Centaur", "Okapi", "Zebra", "Lancer",
     ),
     "Compound": (
         "Queen", "Zeus's Smite", "Dragon Horse", "Dragon King",
-        "Princess", "Empress", "Amazon",
+        "Princess", "Empress", "Amazon", "Poseidon's Trident",
+        "Hades' Underworld",
     ),
 }
 CARD_SLOT_CATEGORIES = ("Slider", "Slider", "Leaper", "Leaper", "Compound")
@@ -104,6 +105,8 @@ class EnemyAgent(ap.Agent):
         self.is_boss = piece_type == "Boss"
         self.health = BOSS_MAX_HEALTH if self.is_boss else None
         self.cards = []
+        # Compound cards the Card King has actually used this level.
+        self.played_compound_cards = []
 
 
 class CardChessModel(ap.Model):
@@ -141,11 +144,16 @@ class CardChessModel(ap.Model):
         self.shuffle_count = 1
         self.en_passant_target = None
         self.en_passant_victim = None
+        # Compound cards that have actually been played this level. Hades'
+        # Underworld can copy one of these cards on a later turn.
+        self.played_compound_cards = []
         self.move_count = 0
         self.enemy_turn_index = 0
         self.message = "Drag the king to a highlighted square."
         self.game_over = False
         self.outcome = None
+        # Details shown by the interface when an enemy captures the player king.
+        self.loss_details = None
         self.history = []
         self._record_frame("Starting position")
 
@@ -271,6 +279,37 @@ class CardChessModel(ap.Model):
                     return True
         return False
 
+    def _cannon_allows_move(self, start, end, moving_agent=None):
+        """Xiangqi Cannon: slide without a screen, or capture over one screen.
+
+        A quiet move must have an empty destination and no intervening pieces.
+        A capture must land on an opposing piece with exactly one intervening
+        piece (the cannon's screen).
+        """
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        if (dx == 0 and dy == 0) or (dx != 0 and dy != 0):
+            return False
+
+        mover = moving_agent or self.player
+        step_x = (dx > 0) - (dx < 0)
+        step_y = (dy > 0) - (dy < 0)
+        x, y = start[0] + step_x, start[1] + step_y
+        screens = 0
+        while (x, y) != end:
+            if self._occupied((x, y), ignore=mover) is not None:
+                screens += 1
+            x += step_x
+            y += step_y
+
+        destination_occupant = self._occupied(end, ignore=mover)
+        if destination_occupant is None:
+            return screens == 0
+        if mover is self.player:
+            is_opponent = self._enemy_at(end) is not None
+        else:
+            is_opponent = end == tuple(self.grid.positions[self.player])
+        return is_opponent and screens == 1
+
     @staticmethod
     def _leap_matches(dx, dy, offsets):
         return (dx, dy) in offsets
@@ -319,20 +358,61 @@ class CardChessModel(ap.Model):
         queen_rays = ortho + diag
         knight_offsets = {(2, 1), (1, 2)}
 
+        if card_name == "Poseidon's Trident":
+            # The Trident is evaluated from the moving agent's perspective:
+            # the player cannot land on enemy pieces, and the Card King
+            # cannot land on the player's king. Allied pieces remain blocked
+            # by the normal destination-occupancy checks.
+            mover = moving_agent or self.player
+            origin = tuple(self.grid.positions[mover])
+            if end == origin:
+                return False
+            if mover is self.player:
+                return self._enemy_at(end) is None
+            return end != tuple(self.grid.positions[self.player])
+        if card_name == "Hades' Underworld":
+            # Hades requires the UI/player to select a previously played
+            # Compound card; its resolved movement is handled by the caller.
+            return False
         if card_name == "Zeus's Smite":
             return self._enemy_at(end) is not None
         if card_name == "Lion":
             return bool(self._lion_paths_to(end))
         if card_name == "Checker":
+            # On the enemy back rank, the Checker card becomes a Checker
+            # Queen: it moves diagonally like a bishop, with captures handled
+            # separately as jumps over an enemy piece.
+            if start[1] == 0:
+                return self._ray_move(start, end, diag, moving_agent)
             return abs(dx_signed) == 1 and dy_signed == -1
         if card_name == "Pawn":
+            # When the king is on the enemy back rank (y == 0),
+            # the Pawn card temporarily grants Queen movement.
+            # Away from that rank, it keeps its normal Pawn movement.
+            if start[1] == 0:
+                return self._ray_move(start, end, queen_rays, moving_agent)
+
+            # In the player's half of the board (rows 4 through 7),
+            # the Pawn card may advance two squares straight forward.
+            # Both the intermediate and destination squares must be empty.
+            if moving_agent is None or moving_agent is self.player:
+                if start[1] >= 4 and dx == 0 and dy_signed == -2:
+                    intermediate = (start[0], start[1] - 1)
+                    blocker = moving_agent or self.player
+                    return (
+                        self._occupied(intermediate, ignore=blocker) is None
+                        and self._occupied(end, ignore=blocker) is None
+                    )
+
             if dx == 0 and dy_signed == -1:
-                return self._occupied(end, ignore=self.player) is None
+                return self._occupied(end, ignore=moving_agent or self.player) is None
             return dx == 1 and dy_signed == -1 and self._enemy_at(end) is not None
         if card_name == "King":
             return max(dx, dy) == 1
         if card_name == "Rook":
             return self._ray_move(start, end, ortho, moving_agent)
+        if card_name == "Cannon":
+            return self._cannon_allows_move(start, end, moving_agent)
         if card_name == "Bishop":
             return self._ray_move(start, end, diag, moving_agent)
         if card_name == "Stag":
@@ -356,7 +436,8 @@ class CardChessModel(ap.Model):
         if card_name == "Zebra":
             return (dx, dy) in {(2, 3), (3, 2)}
         if card_name == "Lancer":
-            return (dx, dy) in {(0, 2), (1, 2), (2, 1), (2, 0)}
+            return (dx, dy) in {(1, 1), (1, -1), (-1, 1), (-1, -1),
+                (1, 2), (-1, 2), (1, -2), (-1, -2)}
         if card_name == "Phoenix":
             return max(dx, dy) == 1 and (dx == 0 or dy == 0) or (dx, dy) == (2, 2)
         if card_name == "Kirin":
@@ -377,17 +458,21 @@ class CardChessModel(ap.Model):
             return self._ray_move(start, end, queen_rays, moving_agent) or (dx, dy) in knight_offsets
         return False
 
+    def _en_passant_victim_for_move(self, start, end):
+        """Pawn-card bypass capture: capture a horizontally adjacent enemy
+        while landing one square diagonally forward behind that enemy.
+        It is not restricted by enemy piece type or its previous move.
+        """
+        start, end = tuple(start), tuple(end)
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        if abs(dx) != 1 or dy != -1 or self._occupied(end, ignore=self.player) is not None:
+            return None
+        adjacent = (start[0] + dx, start[1])
+        victim = self._enemy_at(adjacent)
+        return victim if victim is not None and victim.alive else None
+
     def _is_en_passant_move(self, start, end):
-        if self.en_passant_target != tuple(end) or self.en_passant_victim is None:
-            return False
-        dx = abs(end[0] - start[0])
-        dy = end[1] - start[1]
-        return (
-            dx == 1
-            and dy == -1
-            and self.en_passant_victim.alive
-            and self._enemy_at(end) is None
-        )
+        return self._en_passant_victim_for_move(start, end) is not None
 
     def _best_lion_path(self, destination):
         paths = self._lion_paths_to(destination)
@@ -399,25 +484,40 @@ class CardChessModel(ap.Model):
         )
 
     def _checker_capture_paths(self):
-        """Find complete forward-jump capture sequences for the Checker card."""
+        """Find complete Checker capture chains, including Checker Queen jumps.
+
+        A regular Checker captures forward by jumping one diagonal square.
+        When the player king starts on the enemy back rank (y == 0), the
+        Checker card becomes a Checker Queen and may jump diagonally in any
+        of the four directions. In either mode, each capture lands on the
+        immediately adjacent empty square beyond the victim.
+        """
         start = tuple(self.grid.positions[self.player])
+        is_checker_queen = start[1] == 0
         enemies = {
             tuple(self.grid.positions[enemy]): enemy
             for enemy in self.living_enemies
         }
+        directions = (
+            ((-1, -1), (1, -1), (-1, 1), (1, 1))
+            if is_checker_queen else ((-1, -1), (1, -1))
+        )
         routes = []
 
         def search(position, remaining_enemies, landings, captured):
             found_jump = False
-            for dx in (-1, 1):
-                middle = (position[0] + dx, position[1] - 1)
-                landing = (position[0] + 2 * dx, position[1] - 2)
+            for dx, dy in directions:
+                middle = (position[0] + dx, position[1] + dy)
+                landing = (position[0] + 2 * dx, position[1] + 2 * dy)
                 if not self._inside(middle) or not self._inside(landing):
                     continue
 
                 victim = remaining_enemies.get(middle)
                 if victim is None or landing in remaining_enemies:
                     continue
+                # Only enemies not yet captured remain as blockers. This
+                # also lets a chain reuse a square vacated by an earlier
+                # capture; the king's original square is vacant after jumping.
 
                 found_jump = True
                 next_enemies = dict(remaining_enemies)
@@ -436,7 +536,7 @@ class CardChessModel(ap.Model):
         return routes
 
     def _best_checker_path(self, destination):
-        """Return the longest capture chain ending on the selected square."""
+        """Return the longest available capture chain ending on a square."""
         routes = [
             route
             for route in self._checker_capture_paths()
@@ -446,15 +546,29 @@ class CardChessModel(ap.Model):
             return None
         return max(routes, key=lambda route: len(route[1]))
 
-    def legal_destinations(self, card_index=0):
-        """Return board squares the king can enter with an unused card."""
+    @property
+    def hades_card_choices(self):
+        """Previously played Compound cards available for Hades to copy."""
+        return list(dict.fromkeys(self.played_compound_cards))
+
+    def legal_destinations(self, card_index=0, hades_choice=None):
+        """Return board squares the king can enter with an unused card.
+
+        ``hades_choice`` is the name of a previously played Compound card
+        selected when the hand contains Hades' Underworld.
+        """
         if not isinstance(card_index, int) or not 0 <= card_index < len(self.cards):
             return []
         card = self.cards[card_index]
         if card["used"]:
             return []
         start = tuple(self.grid.positions[self.player])
-        if card["name"] == "Checker":
+        effective_name = card["name"]
+        if effective_name == "Hades' Underworld":
+            if hades_choice not in self.hades_card_choices:
+                return []
+            effective_name = hades_choice
+        if effective_name == "Checker":
             capture_routes = self._checker_capture_paths()
             if capture_routes:
                 longest = max(len(captured) for _, captured in capture_routes)
@@ -463,6 +577,18 @@ class CardChessModel(ap.Model):
                     for path, captured in capture_routes
                     if path and len(captured) == longest
                 })]
+
+            if start[1] == 0:
+                # Checker Queen's quiet moves are bishop-like diagonal slides.
+                return [
+                    [x, y]
+                    for y in range(BOARD_SIZE)
+                    for x in range(BOARD_SIZE)
+                    if self._occupied((x, y), ignore=self.player) is None
+                    and self._ray_move(start, (x, y),
+                                       ((1, 1), (1, -1), (-1, 1), (-1, -1)),
+                                       self.player)
+                ]
 
             return [
                 [start[0] + dx, start[1] - 1]
@@ -479,14 +605,18 @@ class CardChessModel(ap.Model):
                 if occupant is not None and occupant is not self._enemy_at(end):
                     continue
                 if (
-                    self._card_allows_move(start, end, card["name"])
-                    or self._is_en_passant_move(start, end)
+                    self._card_allows_move(start, end, effective_name)
+                    or (effective_name == "Pawn" and self._is_en_passant_move(start, end))
                 ):
                     destinations.append([x, y])
         return destinations
 
-    def play_card_move(self, destination, card_index=0):
-        """Apply a valid player move, capture enemies, then move one enemy."""
+    def play_card_move(self, destination, card_index=0, hades_choice=None):
+        """Apply a valid player move, capture enemies, then move one enemy.
+
+        For Hades' Underworld, pass ``hades_choice`` as the name of an
+        eligible previously played Compound card.
+        """
         if self.game_over:
             self.message = "The game is over. Reset to play again."
             return False
@@ -506,14 +636,26 @@ class CardChessModel(ap.Model):
         if card["used"]:
             self.message = "That card has already been used this shuffle."
             return False
-        if destination not in [tuple(square) for square in self.legal_destinations(card_index)]:
-            self.message = f"That move does not match the {card['name']} card. Try a highlighted square."
+        card_name = card["name"]
+        effective_name = card_name
+        if card_name == "Hades' Underworld":
+            if hades_choice not in self.hades_card_choices:
+                self.message = "Choose a Compound card you have played before for Hades' Underworld."
+                return False
+            effective_name = hades_choice
+        if destination not in [tuple(square) for square in self.legal_destinations(
+            card_index, hades_choice=hades_choice
+        )]:
+            self.message = f"That move does not match the {effective_name} effect."
             return False
 
-        card_name = card["name"]
-        lion_path = self._best_lion_path(destination) if card_name == "Lion" else None
-        checker_path = self._best_checker_path(destination) if card_name == "Checker" else None
-        en_passant_capture = self._is_en_passant_move(start, destination)
+        lion_path = self._best_lion_path(destination) if effective_name == "Lion" else None
+        checker_path = self._best_checker_path(destination) if effective_name == "Checker" else None
+        en_passant_victim = (
+            self._en_passant_victim_for_move(start, destination)
+            if effective_name == "Pawn" else None
+        )
+        en_passant_capture = en_passant_victim is not None
         captured = []
         if checker_path:
             captured = checker_path[1]
@@ -522,14 +664,14 @@ class CardChessModel(ap.Model):
                 enemy = self._enemy_at(square)
                 if enemy is not None and enemy not in captured:
                     captured.append(enemy)
-            if en_passant_capture and self.en_passant_victim not in captured:
-                captured.append(self.en_passant_victim)
+            if en_passant_capture and en_passant_victim not in captured:
+                captured.append(en_passant_victim)
         else:
             direct_capture = self._enemy_at(destination)
             if direct_capture is not None:
                 captured.append(direct_capture)
             elif en_passant_capture:
-                captured.append(self.en_passant_victim)
+                captured.append(en_passant_victim)
 
         boss_captured = self.boss is not None and self.boss in captured
         for enemy in captured:
@@ -547,10 +689,18 @@ class CardChessModel(ap.Model):
         self.player.position = destination
         self.move_count += 1
         card["used"] = True
-        self._record_frame(f"Player moved using the {card_name} card")
+        if card.get("category") == "Compound" and card_name != "Hades' Underworld":
+            if card_name not in self.played_compound_cards:
+                self.played_compound_cards.append(card_name)
+        self._record_frame(
+            f"Player moved using {card_name}"
+            + (f" (copied {effective_name})" if effective_name != card_name else "")
+        )
 
+        boss_respawned = False
         if boss_captured and self.boss.health > 0:
             self._respawn_boss()
+            boss_respawned = True
             self.message = f"You struck the Card King! {self.boss.health} boss health remaining."
             self._record_frame("The Card King respawned")
         elif boss_captured:
@@ -572,14 +722,24 @@ class CardChessModel(ap.Model):
             return True
 
         if self.remaining_card_count:
-            self.cards_message = f"Moved with {card_name}."
+            self.cards_message = f"Moved with {card_name}" + (
+                f" (copied {effective_name})." if effective_name != card_name else "."
+            )
         else:
             self.cards = self._draw_hand()
             self.reshuffle_used = False
             self.shuffle_count += 1
-            self.cards_message = f"Moved with {card_name}; your five-card hand was refreshed."
+            self.cards_message = f"Moved with {card_name}" + (
+                f" (copied {effective_name})" if effective_name != card_name else ""
+            ) + "; your five-card hand was refreshed."
 
-        enemy_message = self._take_enemy_turn()
+        # A Card King respawn consumes its entire enemy turn. It cannot move
+        # or spend a movement card until after the player has moved again.
+        enemy_message = (
+            "The Card King used its turn to respawn and cannot move this turn."
+            if boss_respawned
+            else self._take_enemy_turn()
+        )
         if self.game_over:
             self.outcome = "enemy_win"
             self.message = enemy_message
@@ -662,6 +822,23 @@ class CardChessModel(ap.Model):
                 self.grid.move_to(enemy, original_position)
                 enemy.position = original_position
 
+    def _refresh_boss_hand_if_unusable(self, boss, max_attempts=100):
+        """Redraw the Card King's hand when none of its unused cards can move.
+
+        The played Compound-card history is preserved so Hades' Underworld
+        can still copy cards used earlier in the level.
+        """
+        if not boss.is_boss or self._enemy_destinations(boss):
+            return False
+
+        for _ in range(max_attempts):
+            boss.cards = self._draw_hand()
+            if self._enemy_destinations(boss):
+                return True
+
+        # Avoid an infinite reroll if the board position itself has no moves.
+        return False
+
     def _enemy_piece_allows(self, enemy, start, end):
         x1, y1 = start
         x2, y2 = end
@@ -708,8 +885,24 @@ class CardChessModel(ap.Model):
             )
         if card_name == "Checker":
             return ax == 1 and dy == 1
+        if card_name == "Hades' Underworld":
+            # Hades can copy only a Compound card the Card King has already
+            # played during this level. Try each recorded card's movement.
+            return any(
+                self._boss_card_allows_move(start, end, previous_name, boss)
+                for previous_name in boss.played_compound_cards
+            )
         if card_name == "Zeus's Smite":
             return end == tuple(self.grid.positions[self.player])
+        if card_name == "Cannon":
+            return self._cannon_allows_move(start, end, moving_agent=boss)
+        if card_name == "Poseidon's Trident":
+            # This check can run after the boss has already been moved to
+            # ``end``. Compare against the supplied original square instead
+            # of reading the boss's now-updated grid position.
+            return tuple(end) != tuple(start) and tuple(end) != tuple(
+                self.grid.positions[self.player]
+            )
         if card_name == "Lion":
             return 0 < max(ax, ay) <= 2
         # Other card patterns are direction-neutral. The moving agent is
@@ -717,21 +910,62 @@ class CardChessModel(ap.Model):
         return self._card_allows_move(start, end, card_name, moving_agent=boss)
 
     def _spend_boss_card_for_move(self, boss, start, end):
-        """Spend one matching card and deal a fresh hand after five uses."""
+        """Spend a matching card, tracking Compound use for Hades.
+
+        Prefer a more specific card over Poseidon's Trident when both allow
+        the same move. The Trident's broad movement should only be spent when
+        no other unused card can account for the boss's move.
+        """
+        matching_cards = [
+            card for card in boss.cards
+            if not card["used"]
+            and self._boss_card_allows_move(start, end, card["name"], boss)
+        ]
         card = next(
-            (
-                card for card in boss.cards
-                if not card["used"]
-                and self._boss_card_allows_move(start, end, card["name"], boss)
-            ),
-            None,
+            (candidate for candidate in matching_cards
+             if candidate["name"] != "Poseidon's Trident"),
+            matching_cards[0] if matching_cards else None,
         )
         if card is None:
             return None
+
         card["used"] = True
-        if all(card["used"] for card in boss.cards):
+        card_name = card["name"]
+        used_name = card_name
+        if card_name == "Hades' Underworld":
+            # If several previously played Compound cards permit this move,
+            # copy the one with the greatest overall mobility from the boss's
+            # current square. The AI has already selected the destination
+            # using its normal tactical move scoring; this tie-break chooses
+            # the strongest card to attribute/use for that move.
+            start = tuple(start)
+            eligible = []
+            for history_index, previous_name in enumerate(boss.played_compound_cards):
+                if not self._boss_card_allows_move(start, end, previous_name, boss):
+                    continue
+                mobility = 0
+                for y in range(BOARD_SIZE):
+                    for x in range(BOARD_SIZE):
+                        candidate = (x, y)
+                        if candidate == start:
+                            continue
+                        occupant = self._occupied(candidate, ignore=boss)
+                        if occupant is not None and occupant is not self.player:
+                            continue
+                        if self._boss_card_allows_move(start, candidate, previous_name, boss):
+                            mobility += 1
+                eligible.append((mobility, -history_index, previous_name))
+            copied_name = max(eligible)[2] if eligible else None
+            used_name = f"Hades' Underworld (copied {copied_name})" if copied_name else card_name
+        elif card.get("category") == "Compound":
+            if card_name not in boss.played_compound_cards:
+                boss.played_compound_cards.append(card_name)
+
+        if all(held_card["used"] for held_card in boss.cards):
+            # Keep the history across hands so Hades remains usable after
+            # the Card King's deck refreshes.
             boss.cards = self._draw_hand()
-        return card["name"]
+        return used_name
 
     def _take_enemy_turn(self):
         """Move an available enemy piece, preferring moves toward the king."""
@@ -753,11 +987,16 @@ class CardChessModel(ap.Model):
             return max(abs(position[0] - king_position[0]), abs(position[1] - king_position[1]))
 
         options = []
+        boss_reshuffled = False
         for offset in range(len(self.enemies)):
             index = (self.enemy_turn_index + offset) % len(self.enemies)
             enemy = self.enemies[index]
             if not enemy.alive:
                 continue
+            if enemy.is_boss:
+                boss_reshuffled = (
+                    self._refresh_boss_hand_if_unusable(enemy) or boss_reshuffled
+                )
             start = tuple(self.grid.positions[enemy])
             starting_distance = distance(start)
             for destination in self._enemy_destinations(enemy):
@@ -800,7 +1039,10 @@ class CardChessModel(ap.Model):
                 ))
 
         if not options:
-            return "Every enemy piece is blocked and has no legal move."
+            message = "Every enemy piece is blocked and has no legal move."
+            if boss_reshuffled:
+                message += " The Card King reshuffled its unusable hand."
+            return message
 
         (
             _, _, _, _, moves_closer, _, _, index, enemy, destination,
@@ -811,8 +1053,35 @@ class CardChessModel(ap.Model):
         self.enemy_turn_index = (index + 1) % len(self.enemies)
 
         if destination == king_position:
+            # Record the exact movement card before ending the game. The boss
+            # normally spends its card after moving, but a king capture exits
+            # early, so account for that card here as well.
+            movement_card = (
+                self._spend_boss_card_for_move(enemy, tuple(self.grid.positions[enemy]), destination)
+                if enemy.is_boss
+                else None
+            )
             self.game_over = True
-            return f"The enemy {enemy.piece_type.lower()} captured your king. Game over."
+            self.outcome = "enemy_win"
+            self.loss_details = {
+                "piece": enemy.piece_type,
+                "movement_card": movement_card,
+                "start": list(tuple(self.grid.positions[enemy])),
+                "destination": list(destination),
+            }
+            if movement_card:
+                message = (
+                    f"The Card King captured your king using {movement_card}. "
+                    "Game over."
+                )
+            else:
+                message = (
+                    f"The enemy {enemy.piece_type.lower()} captured your king. "
+                    "Game over."
+                )
+            if boss_reshuffled:
+                message += " The Card King reshuffled its unusable hand."
+            return message
 
         start = tuple(self.grid.positions[enemy])
         original_y = int(self.grid.positions[enemy][1])
@@ -829,17 +1098,32 @@ class CardChessModel(ap.Model):
         self._record_frame(f"Enemy {enemy.piece_type.lower()} moved")
         if current_king_threats and enemy_king is not None:
             if king_threats_after == 0:
-                return f"The enemy {enemy.piece_type.lower()} protected its king from your cards."
+                message = f"The enemy {enemy.piece_type.lower()} protected its king from your cards."
+                if boss_reshuffled:
+                    message += " The Card King reshuffled its unusable hand."
+                return message
             if king_threats_after < current_king_threats:
-                return f"The enemy {enemy.piece_type.lower()} blocked one of your threats to its king."
+                message = f"The enemy {enemy.piece_type.lower()} blocked one of your threats to its king."
+                if boss_reshuffled:
+                    message += " The Card King reshuffled its unusable hand."
+                return message
             if enemy is enemy_king:
-                return "The enemy king moved to escape your threat."
+                message = "The enemy king moved to escape your threat."
+                if boss_reshuffled:
+                    message += " The Card King reshuffled its unusable hand."
+                return message
         if threatened:
-            return f"The enemy {enemy.piece_type.lower()} moved, but your hand can capture it."
-        if moves_closer:
+            message = f"The enemy {enemy.piece_type.lower()} moved, but your hand can capture it."
+        elif moves_closer:
             if boss_card_name:
-                return f"The Card King used {boss_card_name} and moved closer."
-            return f"The enemy {enemy.piece_type.lower()} moved closer while avoiding your cards."
-        if boss_card_name:
-            return f"The Card King used {boss_card_name} to move."
-        return f"The enemy {enemy.piece_type.lower()} moved to avoid your card threats."
+                message = f"The Card King used {boss_card_name} and moved closer."
+            else:
+                message = f"The enemy {enemy.piece_type.lower()} moved closer while avoiding your cards."
+        elif boss_card_name:
+            message = f"The Card King used {boss_card_name} to move."
+        else:
+            message = f"The enemy {enemy.piece_type.lower()} moved to avoid your card threats."
+
+        if boss_reshuffled:
+            message += " The Card King reshuffled its unusable hand."
+        return message

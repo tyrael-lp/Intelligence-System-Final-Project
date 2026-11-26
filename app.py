@@ -37,6 +37,8 @@ CARD_HELP = {
     "Princess": "Combine bishop slides and knight leaps.",
     "Empress": "Combine rook slides and knight leaps.",
     "Amazon": "Combine queen moves and knight leaps.",
+    "Poseidon's Trident": "Teleport to any unoccupied-by-enemy square on the board. You cannot capture with this card.",
+    "Hades' Underworld": "Choose a Compound card you have already played this level, then use its movement and capture rules.",
 }
 
 
@@ -45,6 +47,7 @@ def reset_game():
     st.session_state.game_model = CardChessModel(level=level)
     st.session_state.last_move_id = None
     st.session_state.selected_card = 0
+    st.session_state.pop("hades_choice", None)
     st.session_state.replay_id = st.session_state.get("replay_id", 0) + 1
 
 
@@ -53,6 +56,7 @@ def select_level():
     st.session_state.game_model = CardChessModel(level=level)
     st.session_state.last_move_id = None
     st.session_state.selected_card = 0
+    st.session_state.pop("hades_choice", None)
     st.session_state.replay_id = st.session_state.get("replay_id", 0) + 1
 
 
@@ -60,6 +64,7 @@ def select_card(card_index):
     cards = st.session_state.game_model.cards
     if 0 <= card_index < len(cards) and not cards[card_index]["used"]:
         st.session_state.selected_card = card_index
+        st.session_state.pop("hades_choice", None)
 
 
 def reshuffle_cards():
@@ -90,10 +95,13 @@ def handle_board_move():
     st.session_state.last_move_id = move_id
 
     card_index = st.session_state.get("selected_card", 0)
+    selected = st.session_state.game_model.cards[card_index]
+    hades_choice = st.session_state.get("hades_choice") if selected["name"] == "Hades' Underworld" else None
     moved = st.session_state.game_model.play_card_move(
-        event.get("to"), card_index=card_index
+        event.get("to"), card_index=card_index, hades_choice=hades_choice
     )
     if moved:
+        st.session_state.pop("hades_choice", None)
         next_available = next(
             (
                 index
@@ -388,6 +396,7 @@ if (
     st.session_state.game_model = CardChessModel(level=1)
     st.session_state.last_move_id = None
     st.session_state.selected_card = 0
+    st.session_state.pop("hades_choice", None)
     st.session_state.replay_id = st.session_state.get("replay_id", 0)
 
 if "selected_level" not in st.session_state:
@@ -410,8 +419,19 @@ if game.cards:
             0,
         )
         st.session_state.selected_card = selected_index
-    legal_destinations = game.legal_destinations(selected_index)
+    selected_card_data = game.cards[selected_index]
+    hades_choices = game.hades_card_choices if selected_card_data["name"] == "Hades' Underworld" else []
+    if hades_choices:
+        current_choice = st.session_state.get("hades_choice")
+        if current_choice not in hades_choices:
+            current_choice = hades_choices[0]
+            st.session_state["hades_choice"] = current_choice
+        legal_destinations = game.legal_destinations(selected_index, hades_choice=current_choice)
+    else:
+        legal_destinations = game.legal_destinations(selected_index)
 else:
+    selected_card_data = None
+    hades_choices = []
     legal_destinations = []
 if "replay_id" not in st.session_state:
     st.session_state.replay_id = 0
@@ -450,8 +470,22 @@ if game.remaining_card_count:
     selected_card = game.cards[selected_index]
     st.info(
         f"**Selected: {selected_card['name']} ({selected_card['category']}).** "
-        f"{CARD_HELP[selected_card['name']]}"
+        f"{CARD_HELP.get(selected_card['name'], 'Use the selected card effect.')}"
     )
+    if selected_card["name"] == "Hades' Underworld":
+        choices = game.hades_card_choices
+        if choices:
+            current = st.session_state.get("hades_choice")
+            choice_index = choices.index(current) if current in choices else 0
+            st.selectbox(
+                "Choose a previously played Compound card to copy",
+                options=choices,
+                index=choice_index,
+                key="hades_choice",
+                help="Only Compound cards played earlier in this level are available.",
+            )
+        else:
+            st.warning("You have not played a Compound card yet. Hades' Underworld cannot be used.")
 else:
     st.info("All cards in this hand have been used.")
 
